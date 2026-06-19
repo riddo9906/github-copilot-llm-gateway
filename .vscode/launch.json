@@ -11,8 +11,7 @@
       "outFiles": [
         "${workspaceFolder}/out/**/*.js"
       ],
-      "preLaunchTask": "npm: esbuild-watch",
-      "sourceMaps": true
+      
     },
     {
       "name": "Run Extension (No Build)",
