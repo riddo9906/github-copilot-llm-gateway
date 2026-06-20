@@ -33,70 +33,86 @@ export function buildChatRequest(
     temperature: options.temperature,
   };
 
-  /**
-   * =========================
-   * TOOL PIPELINE (SAFE FIXED)
-   * =========================
-   */
+  // -----------------------------
+  // TOOL PIPELINE
+  // -----------------------------
 
   const inputTools = options.tools ?? [];
 
   if (inputTools.length > 0) {
 
-    // 1. ROUTE (semantic filtering)
     const routedTools = ToolRouter.select(inputTools, {
       model: options.model,
       messages: options.messages
     });
 
-    console.log("[ToolPipeline] input:", inputTools.length, "routed:", routedTools.length);
+    console.log(
+      `[ToolPipeline] input=${inputTools.length} routed=${routedTools.length}`
+    );
 
-    // 2. FIX #2 — HARD GUARD (prevents full tool leakage)
-    if (routedTools.length === 0) {
-      request.tool_choice = 'none';
-      return request;
+    if (routedTools.length > 0) {
+
+      const compactTools = ToolSchemaBuilder.build(routedTools, {
+        maxTools: getMaxToolsForModel(options.model),
+        maxDescriptionLength: 120
+      });
+
+      const finalTools = compactTools.slice(
+        0,
+        getMaxToolsForModel(options.model)
+      );
+
+      if (finalTools.length > 0) {
+        request.tools = finalTools;
+        request.tool_choice = options.toolChoice ?? "auto";
+        request.parallel_tool_calls =
+          options.parallelToolCalls ?? false;
+      }
     }
-
-    // 3. COMPRESS TOOL SCHEMA
-    const compactTools = ToolSchemaBuilder.build(routedTools, {
-      maxTools: getMaxToolsForModel(options.model),
-      maxDescriptionLength: 120
-    });
-
-    // 4. FINAL SAFETY LIMIT (absolute cap)
-    const finalTools = compactTools.slice(0, getMaxToolsForModel(options.model));
-
-    request.tools = finalTools;
-
-    request.tool_choice = options.toolChoice ?? 'auto';
-    request.parallel_tool_calls = options.parallelToolCalls ?? false;
-
-  } else {
-    // no tools at all
-    request.tool_choice = 'none';
   }
 
-  /**
-   * Extra overrides (VS Code / Copilot injection)
-   */
+  // -----------------------------
+  // EXTRA OPTIONS
+  // -----------------------------
+
   if (options.extraOptions) {
+
+    // Prevent downstream code from re-enabling tools
+    delete (options.extraOptions as any).tools;
+    delete (options.extraOptions as any).tool_choice;
+    delete (options.extraOptions as any).parallel_tool_calls;
+
     Object.assign(request, options.extraOptions);
   }
+
+  console.log(
+    "[OpenAI Request]",
+    JSON.stringify(request, null, 2)
+  );
 
   return request;
 }
 
 /**
- * Model-aware tool budget (critical for 1B models like yours)
+ * Model-aware tool budget
  */
 function getMaxToolsForModel(model: string): number {
+
   const m = model.toLowerCase();
 
-  if (m.includes('1b') || m.includes('2b') || m.includes('3b') || m.includes('tiny')) {
+  if (
+    m.includes("1b") ||
+    m.includes("2b") ||
+    m.includes("3b") ||
+    m.includes("tiny")
+  ) {
     return 3;
   }
 
-  if (m.includes('7b') || m.includes('8b')) {
+  if (
+    m.includes("7b") ||
+    m.includes("8b")
+  ) {
     return 6;
   }
 

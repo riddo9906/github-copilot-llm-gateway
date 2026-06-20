@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { GatewayClient } from './client';
 import { GatewayConfig, OpenAIChatCompletionRequest, OpenAIMessage } from './types';
+import { ToolRouter } from './toolRouter';
 import {
   convertMessage,
   flattenToolResultContent,
@@ -561,125 +562,166 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     );
     return models;
   }
-
+ 
   /**
    * Provide language model chat response - streams responses from inference server
    */
-  async provideLanguageModelChatResponse(
-    model: vscode.LanguageModelChatInformation,
-    messages: readonly vscode.LanguageModelChatMessage[],
-    options: vscode.ProvideLanguageModelChatResponseOptions,
-    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-    token: vscode.CancellationToken
-  ): Promise<void> {
-    this.outputChannel.appendLine(`Sending chat request to model: ${model.id}`);
-    this.outputChannel.appendLine(
+   async provideLanguageModelChatResponse(
+     model: vscode.LanguageModelChatInformation,
+     messages: readonly vscode.LanguageModelChatMessage[],
+     options: vscode.ProvideLanguageModelChatResponseOptions,
+     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+     token: vscode.CancellationToken
+     ): Promise<void> {
+     this.outputChannel.appendLine(`Sending chat request to model: ${model.id}`);
+     this.outputChannel.appendLine(
       `Tool mode: ${describeToolMode(options.toolMode)}, Tools: ${options.tools?.length ?? 0}`
-    );
-    this.outputChannel.appendLine(`Message count: ${messages.length}`);
+     );
+     this.outputChannel.appendLine(`Message count: ${messages.length}`);
 
-    const modelName = friendlyModelName(model.id);
-    this._onDidChangeRequestState.fire({ kind: 'start', modelId: model.id, modelName });
+   const modelName = friendlyModelName(model.id);
+     this._onDidChangeRequestState.fire({ kind: 'start', modelId: model.id, modelName });
 
-    const openAIMessages = this.convertAllMessages(messages);
-    this.outputChannel.appendLine(`Converted to ${openAIMessages.length} OpenAI messages`);
-    this.logMessageStructure(openAIMessages);
+   const openAIMessages = this.convertAllMessages(messages);
+     this.outputChannel.appendLine(`Converted to ${openAIMessages.length} OpenAI messages`);
+     this.logMessageStructure(openAIMessages);
 
-    const modelMaxContext = this.resolveModelMaxContext(model);
-    const configuredMaxOutput =
-      model.maxOutputTokens || TOKEN_CONSTANTS.DEFAULT_OUTPUT_TOKENS;
-    const toolsSerializedLength = options.tools ? JSON.stringify(options.tools).length : 0;
+   const modelMaxContext = this.resolveModelMaxContext(model);
+   const configuredMaxOutput =
+    model.maxOutputTokens || TOKEN_CONSTANTS.DEFAULT_OUTPUT_TOKENS;
+  const toolsSerializedLength = options.tools ? JSON.stringify(options.tools).length : 0;
 
-    const maxInputTokens = calculateMaxInputTokens({
-      modelMaxContext,
-      configuredMaxOutput,
-      toolsSerializedLength,
-    });
+  const maxInputTokens = calculateMaxInputTokens({
+    modelMaxContext,
+    configuredMaxOutput,
+    toolsSerializedLength,
+  });
 
-    const truncatedMessages = truncateMessagesToFit(openAIMessages, maxInputTokens, (msg) =>
-      this.outputChannel.appendLine(msg)
-    );
-    if (truncatedMessages.length < openAIMessages.length) {
-      this.outputChannel.appendLine(
-        `WARNING: Truncated conversation from ${openAIMessages.length} to ${truncatedMessages.length} messages to fit context limit`
-      );
-    }
+  const truncatedMessages = truncateMessagesToFit(openAIMessages, maxInputTokens, (msg) =>
+    this.outputChannel.appendLine(msg)
+   );
 
-    const inputText = buildInputText(truncatedMessages);
-    const toolsOverhead = Math.ceil(toolsSerializedLength / TOKEN_CONSTANTS.CHARS_PER_TOKEN);
-    const estimatedInputTokens = await this.provideTokenCount(model, inputText, token);
-    const safeMaxOutputTokens = calculateSafeMaxOutputTokens({
-      estimatedInputTokens,
-      toolsOverhead,
-      modelMaxContext,
-      configuredMaxOutput,
-    });
-
+  if (truncatedMessages.length < openAIMessages.length) {
     this.outputChannel.appendLine(
-      `Token estimate: input=${estimatedInputTokens}, tools=${toolsOverhead}, model_context=${modelMaxContext}, chosen_max_tokens=${safeMaxOutputTokens}`
+      `WARNING: Truncated conversation from ${openAIMessages.length} to ${truncatedMessages.length} messages to fit context limit`
     );
+  }
 
-    const { tools, schemas: toolSchemas } = this.buildToolsConfig(options);
-    const hasTools = tools !== undefined && tools.length > 0;
-    const temperature = hasTools ? this.config.agentTemperature : DEFAULT_TEMPERATURE;
+  const inputText = buildInputText(truncatedMessages);
+  const toolsOverhead = Math.ceil(toolsSerializedLength / TOKEN_CONSTANTS.CHARS_PER_TOKEN);
+  const estimatedInputTokens = await this.provideTokenCount(model, inputText, token);
 
-    const requestOptions = buildChatRequest({
+  const safeMaxOutputTokens = calculateSafeMaxOutputTokens({
+    estimatedInputTokens,
+    toolsOverhead,
+    modelMaxContext,
+    configuredMaxOutput,
+  });
+
+  this.outputChannel.appendLine(
+    `Token estimate: input=${estimatedInputTokens}, tools=${toolsOverhead}, model_context=${modelMaxContext}, chosen_max_tokens=${safeMaxOutputTokens}`
+   );
+
+  // -----------------------------
+// TOOL ROUTING PIPELINE
+// -----------------------------
+
+const {
+  tools: allTools,
+  schemas: toolSchemas,
+} = this.buildToolsConfig(options);
+
+const tools = allTools
+  ? ToolRouter.select(allTools, {
       model: model.id,
       messages: truncatedMessages,
-      maxTokens: safeMaxOutputTokens,
-      temperature,
-      tools,
-      toolChoice: hasTools ? this.mapToolChoice(options.toolMode) : undefined,
-      parallelToolCalls: hasTools ? this.config.parallelToolCalling : undefined,
-      extraOptions: { ...this.config.extraModelOptions, ...options.modelOptions },
+    })
+  : undefined;
+
+this.outputChannel.appendLine(
+  `[ToolPipeline] input=${allTools?.length ?? 0} routed=${tools?.length ?? 0}`
+);
+
+  const hasTools = Array.isArray(tools) && tools.length > 0;
+
+  const temperature = hasTools
+    ? this.config.agentTemperature
+    : DEFAULT_TEMPERATURE;
+
+  const requestOptions = buildChatRequest({
+    model: model.id,
+    messages: truncatedMessages,
+    maxTokens: safeMaxOutputTokens,
+    temperature,
+    tools,
+    toolChoice: hasTools ? this.mapToolChoice(options.toolMode) : undefined,
+    parallelToolCalls: hasTools ? this.config.parallelToolCalling : undefined,
+    extraOptions: {
+      ...this.config.extraModelOptions,
+      ...options.modelOptions,
+    },
+  });
+
+  if (hasTools) {
+    this.outputChannel.appendLine(
+      `Sending ${tools.length} tools to model (parallel: ${this.config.parallelToolCalling})`
+    );
+  }
+
+  this.logRequest(requestOptions);
+
+  let capturedUsage: TokenUsage | undefined;
+
+  try {
+    const reporter = this.createStreamReporter(progress, (usage) => {
+      capturedUsage = usage;
     });
 
-    if (hasTools) {
-      this.outputChannel.appendLine(
-        `Sending ${tools.length} tools to model (parallel: ${this.config.parallelToolCalling})`
+    const chunks = this.client.streamChatCompletion(requestOptions, token);
+
+    const stats = await streamResponse({
+      chunks: chunks as AsyncIterable<StreamChunk>,
+      reporter,
+      isCancelled: () => token.isCancellationRequested,
+      resolveToolCallArgs: (toolCall) =>
+        this.resolveToolCallArgs(toolCall, toolSchemas),
+    });
+
+    this.outputChannel.appendLine(
+      `Completed chat request, received ${stats.totalContentLength} chars, ${stats.totalTextParts} text parts, ${stats.totalToolCalls} tool calls`
+    );
+
+    if (isEmptyStreamResult(stats)) {
+      const toolCount = tools?.length ?? 0;
+      await this.handleEmptyResponse(
+        model,
+        inputText,
+        openAIMessages.length,
+        toolCount,
+        token,
+        progress
       );
     }
 
-    this.logRequest(requestOptions);
+    this.recordCompletedRequest(model.id, modelName, capturedUsage);
 
-    let capturedUsage: TokenUsage | undefined;
-    try {
-      const reporter = this.createStreamReporter(progress, (usage) => {
-        capturedUsage = usage;
-      });
-      const chunks = this.client.streamChatCompletion(requestOptions, token);
-      const stats = await streamResponse({
-        chunks: chunks as AsyncIterable<StreamChunk>,
-        reporter,
-        isCancelled: () => token.isCancellationRequested,
-        resolveToolCallArgs: (toolCall) => this.resolveToolCallArgs(toolCall, toolSchemas),
-      });
+    this._onDidChangeRequestState.fire({
+      kind: 'complete',
+      modelId: model.id,
+      modelName,
+      usage: capturedUsage,
+    });
+  } catch (error) {
+    this._onDidChangeRequestState.fire({
+      kind: 'error',
+      modelId: model.id,
+      modelName,
+      errorMessage: error instanceof Error ? error.message : String(error),
+    });
 
-      this.outputChannel.appendLine(
-        `Completed chat request, received ${stats.totalContentLength} chars, ${stats.totalTextParts} text parts, ${stats.totalToolCalls} tool calls`
-      );
-
-      if (isEmptyStreamResult(stats)) {
-        const toolCount = tools?.length ?? 0;
-        await this.handleEmptyResponse(model, inputText, openAIMessages.length, toolCount, token, progress);
-      }
-      this.recordCompletedRequest(model.id, modelName, capturedUsage);
-      this._onDidChangeRequestState.fire({
-        kind: 'complete',
-        modelId: model.id,
-        modelName,
-        usage: capturedUsage,
-      });
-    } catch (error) {
-      this._onDidChangeRequestState.fire({
-        kind: 'error',
-        modelId: model.id,
-        modelName,
-        errorMessage: error instanceof Error ? error.message : String(error),
-      });
-      this.handleChatError(error);
-    }
+    this.handleChatError(error);
   }
+}
 
   /**
    * Provide token count estimation (rough char/4 approximation).
