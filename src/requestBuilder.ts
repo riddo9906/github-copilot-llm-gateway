@@ -33,11 +33,34 @@ export function buildChatRequest(
     temperature: options.temperature,
   };
 
+  const noToolInstruction =
+    'Answer directly in plain text. Do not emit tool calls or tool-call JSON unless the user explicitly asks for tool use.';
+
   // -----------------------------
   // TOOL PIPELINE
   // -----------------------------
 
   const inputTools = options.tools ?? [];
+  const shouldAddNoToolInstruction = inputTools.length === 0 || !ToolRouter.select(inputTools, {
+    model: options.model,
+    messages: options.messages
+  }).length;
+
+  if (shouldAddNoToolInstruction) {
+    const existingMessages = Array.isArray(options.messages) ? options.messages : [];
+    const hasSystemPrompt = existingMessages.some((message) => message.role === 'system');
+    const prefixedMessages = hasSystemPrompt
+      ? existingMessages.map((message, index) => {
+          if (index !== 0 || message.role !== 'system') {
+            return message;
+          }
+          const existingContent = typeof message.content === 'string' ? message.content : '';
+          const nextContent = existingContent ? `${existingContent}\n${noToolInstruction}` : noToolInstruction;
+          return { ...message, content: nextContent };
+        })
+      : [{ role: 'system', content: noToolInstruction }, ...existingMessages];
+    request.messages = prefixedMessages as OpenAIMessage[];
+  }
 
   if (inputTools.length > 0) {
 
@@ -50,23 +73,27 @@ export function buildChatRequest(
       `[ToolPipeline] input=${inputTools.length} routed=${routedTools.length}`
     );
 
-    if (routedTools.length > 0) {
+    if (routedTools.length === 0) {
+      return request;
+    }
 
-      const compactTools = ToolSchemaBuilder.build(routedTools, {
-        maxTools: getMaxToolsForModel(options.model),
-        maxDescriptionLength: 120
-      });
+    const compactTools = ToolSchemaBuilder.build(routedTools, {
+      maxTools: getMaxToolsForModel(options.model),
+      maxDescriptionLength: 120
+    });
 
-      const finalTools = compactTools.slice(
-        0,
-        getMaxToolsForModel(options.model)
-      );
+    const finalTools = compactTools.slice(
+      0,
+      getMaxToolsForModel(options.model)
+    );
 
-      if (finalTools.length > 0) {
-        request.tools = finalTools;
-        request.tool_choice = options.toolChoice ?? "auto";
-        request.parallel_tool_calls =
-          options.parallelToolCalls ?? false;
+    if (finalTools.length > 0) {
+      request.tools = finalTools;
+      if (options.toolChoice === 'required' || options.toolChoice === 'none') {
+        request.tool_choice = options.toolChoice;
+      }
+      if (options.parallelToolCalls === true) {
+        request.parallel_tool_calls = true;
       }
     }
   }

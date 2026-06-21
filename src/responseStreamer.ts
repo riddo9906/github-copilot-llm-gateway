@@ -58,8 +58,8 @@ export interface StreamResponseParams {
    * JSON-repairing the arguments and filling any missing required properties
    * from the tool's schema.
    */
-  resolveToolCallArgs: (toolCall: { id: string; name: string; arguments: string }) => Record<string, unknown>;
-}
+  resolveToolCallArgs: (toolCall: { id: string; name: string; arguments: string }) => Record<string, unknown>;  /** When false, tool calls emitted by the model are ignored. */
+  allowToolCalls?: boolean;}
 
 const FORCE_CLOSED_THINKING_FALLBACK =
   '*(The model ran out of output tokens while thinking and could not produce a response. ' +
@@ -102,14 +102,122 @@ function reportParserPiece(
  * through the reporter.
  * @returns updated inReasoningField flag.
  */
+function findMatchingBrace(text: string, openBraceIndex: number): number {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = openBraceIndex; i < text.length; i++) {
+    const char = text[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+    } else if (char === '{') {
+      depth++;
+    } else if (char === '}') {
+      depth--;
+      if (depth === 0) {
+        return i;
+      }
+    }
+  }
+
+  return -1;
+}
+
+function stripToolCallLikePayload(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return '';
+  }
+
+  const toolCallLikeRegex = /\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:/i;
+  const match = trimmed.match(toolCallLikeRegex);
+  if (!match) {
+    return text;
+  }
+
+  const start = trimmed.indexOf('{', match.index ?? 0);
+  if (start === -1) {
+    return text;
+  }
+
+  const end = findMatchingBrace(trimmed, start);
+  if (end === -1) {
+    return text;
+  }
+
+  const before = trimmed.slice(0, start).trim();
+  const after = trimmed.slice(end + 1).trim();
+  const pieces = [before, after].filter(Boolean);
+  return pieces.join('\n').trim();
+}
+
+function sanitizeChunkWithPartialPayloads(content: string, pendingToolCallBuffer?: string): { sanitized: string; pending: string } {
+  if (!content && !pendingToolCallBuffer) {
+    return { sanitized: '', pending: '' };
+  }
+
+  const combined = `${pendingToolCallBuffer ?? ''}${content}`;
+  const candidateStart = combined.search(/\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:/i);
+  if (candidateStart === -1) {
+    return { sanitized: pendingToolCallBuffer ? '' : content, pending: pendingToolCallBuffer ?? '' };
+  }
+
+  const prefix = combined.slice(0, candidateStart);
+  const remainder = combined.slice(candidateStart);
+  const stripped = stripToolCallLikePayload(remainder);
+  if (stripped === remainder) {
+    return { sanitized: prefix, pending: remainder };
+  }
+
+  return { sanitized: `${prefix}${stripped}`, pending: '' };
+}
+
+export function sanitizeContentForNoToolCalls(content: unknown): string {
+  if (content === null || content === undefined) {
+    return '';
+  }
+
+  if (typeof content === 'string') {
+    const trimmed = content.trim();
+    if (!trimmed) {
+      return '';
+    }
+
+    const { sanitized } = sanitizeChunkWithPartialPayloads(content);
+    return sanitized.trim();
+  }
+
+  if (typeof content === 'object') {
+    const serialized = JSON.stringify(content);
+    return sanitizeContentForNoToolCalls(serialized);
+  }
+
+  return String(content);
+}
+
 function processStreamChunk(
   chunk: StreamChunk,
   parser: ThinkingParser,
   reporter: StreamReporter,
   stats: StreamStats,
   inReasoningField: boolean,
-  resolveToolCallArgs: StreamResponseParams['resolveToolCallArgs']
-): boolean {
+  resolveToolCallArgs: StreamResponseParams['resolveToolCallArgs'],
+  allowToolCalls: boolean,
+  pendingToolCallBuffer: string
+): { inReasoningField: boolean; pendingToolCallBuffer: string } {
   if (chunk.reasoning_content) {
     stats.hadThinking = true;
     inReasoningField = true;
@@ -121,13 +229,24 @@ function processStreamChunk(
       inReasoningField = false;
       reporter.reportThinkingDone();
     }
-    stats.totalContentLength += chunk.content.length;
-    for (const piece of parser.process(chunk.content)) {
+
+    const { sanitized, pending } = sanitizeChunkWithPartialPayloads(chunk.content, pendingToolCallBuffer);
+    pendingToolCallBuffer = pending;
+    const visibleText = sanitized.trim();
+    if (!visibleText) {
+      return { inReasoningField, pendingToolCallBuffer };
+    }
+
+    stats.totalContentLength += visibleText.length;
+    for (const piece of parser.process(visibleText)) {
       reportParserPiece(piece, reporter, stats, false);
     }
   }
 
   if (chunk.finished_tool_calls?.length) {
+    if (!allowToolCalls) {
+      return { inReasoningField, pendingToolCallBuffer };
+    }
     for (const toolCall of chunk.finished_tool_calls) {
       stats.totalToolCalls++;
       const args = resolveToolCallArgs(toolCall);
@@ -143,7 +262,7 @@ function processStreamChunk(
     reporter.reportUsage(chunk.usage);
   }
 
-  return inReasoningField;
+  return { inReasoningField, pendingToolCallBuffer };
 }
 
 /**
@@ -165,14 +284,22 @@ export async function streamResponse(params: StreamResponseParams): Promise<Stre
 
   const parser = new ThinkingParser();
   let inReasoningField = false;
+  let pendingToolCallBuffer = '';
 
   for await (const chunk of chunks) {
     if (isCancelled()) {
       break;
     }
-    inReasoningField = processStreamChunk(
-      chunk, parser, reporter, stats, inReasoningField, resolveToolCallArgs
-    );
+    ({ inReasoningField, pendingToolCallBuffer } = processStreamChunk(
+      chunk,
+      parser,
+      reporter,
+      stats,
+      inReasoningField,
+      resolveToolCallArgs,
+      params.allowToolCalls ?? true,
+      pendingToolCallBuffer
+    ));
   }
 
   // Flush any remaining buffered content. 'E' pieces here signal that the

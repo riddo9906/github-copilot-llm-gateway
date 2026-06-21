@@ -24,6 +24,7 @@ import {
   StreamChunk,
   StreamReporter,
   isEmptyStreamResult,
+  sanitizeContentForNoToolCalls,
   streamResponse,
 } from './responseStreamer';
 import { dedupeModels, friendlyModelName } from './modelDisplay';
@@ -585,6 +586,10 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
    const openAIMessages = this.convertAllMessages(messages);
      this.outputChannel.appendLine(`Converted to ${openAIMessages.length} OpenAI messages`);
      this.logMessageStructure(openAIMessages);
+     const systemPreview = openAIMessages.find((msg) => msg.role === 'system');
+     this.outputChannel.appendLine(
+       `[debug] system=${typeof systemPreview?.content === 'string' ? systemPreview.content.slice(0, 120) : '<none>'} roles=${openAIMessages.map((msg) => msg.role).join(',')}`
+     );
 
    const modelMaxContext = this.resolveModelMaxContext(model);
    const configuredMaxOutput =
@@ -641,9 +646,10 @@ const tools = allTools
 this.outputChannel.appendLine(
   `[ToolPipeline] input=${allTools?.length ?? 0} routed=${tools?.length ?? 0}`
 );
-
+  this.outputChannel.appendLine(
+    `[debug] tools=${tools?.map((tool) => tool.function?.name ?? '?').join(',') ?? '<none>'}`
+  );
   const hasTools = Array.isArray(tools) && tools.length > 0;
-
   const temperature = hasTools
     ? this.config.agentTemperature
     : DEFAULT_TEMPERATURE;
@@ -668,14 +674,20 @@ this.outputChannel.appendLine(
     );
   }
 
+  this.outputChannel.appendLine(
+    `[debug] toolChoice=${requestOptions.tool_choice ?? '<none>'} parallel=${requestOptions.parallel_tool_calls === true}`
+  );
   this.logRequest(requestOptions);
 
   let capturedUsage: TokenUsage | undefined;
 
   try {
-    const reporter = this.createStreamReporter(progress, (usage) => {
-      capturedUsage = usage;
-    });
+    const reporter = this.createStreamReporter(
+      progress,
+      (usage) => {
+        capturedUsage = usage;
+      }
+    );
 
     const chunks = this.client.streamChatCompletion(requestOptions, token);
 
@@ -685,6 +697,7 @@ this.outputChannel.appendLine(
       isCancelled: () => token.isCancellationRequested,
       resolveToolCallArgs: (toolCall) =>
         this.resolveToolCallArgs(toolCall, toolSchemas),
+      allowToolCalls: hasTools,
     });
 
     this.outputChannel.appendLine(
@@ -949,8 +962,6 @@ this.outputChannel.appendLine(
     switch (toolMode) {
       case vscode.LanguageModelChatToolMode.Required:
         return 'required';
-      case vscode.LanguageModelChatToolMode.Auto:
-        return 'auto';
       default:
         return undefined;
     }
@@ -1041,7 +1052,12 @@ this.outputChannel.appendLine(
     onUsage?: (usage: TokenUsage) => void
   ): StreamReporter {
     return {
-      reportText: (text) => progress.report(new vscode.LanguageModelTextPart(text)),
+      reportText: (text) => {
+        const sanitized = sanitizeContentForNoToolCalls(text);
+        if (sanitized) {
+          progress.report(new vscode.LanguageModelTextPart(sanitized));
+        }
+      },
       reportThinking: (text) => progress.report(new vscode.LanguageModelThinkingPart(text)),
       reportThinkingDone: () =>
         progress.report(new vscode.LanguageModelThinkingPart('', '', { vscode_reasoning_done: true })),

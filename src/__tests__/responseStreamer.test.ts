@@ -160,6 +160,58 @@ describe('streamResponse', () => {
     assert.deepEqual(events[0].args, { q: 'hi' });
   });
 
+  test('ignores tool calls when the request did not advertise tools', async () => {
+    const { reporter, events } = makeReporter();
+    const stats = await streamResponse({
+      chunks: iter([
+        {
+          finished_tool_calls: [
+            { id: 'c1', name: 'read_file', arguments: '{"filePath":"/tmp/x"}' },
+          ],
+        },
+      ]),
+      reporter,
+      isCancelled: () => false,
+      resolveToolCallArgs: (tc) => JSON.parse(tc.arguments) as Record<string, unknown>,
+      allowToolCalls: false,
+    });
+    assert.equal(stats.totalToolCalls, 0);
+    assert.deepEqual(events, []);
+  });
+
+  test('strips tool-call-like JSON from text when tool calls are not allowed', async () => {
+    const { reporter, events } = makeReporter();
+    const stats = await streamResponse({
+      chunks: iter([{ content: 'hi\n\n{"name":"read_file","arguments":{"filePath":"/tmp/x"}}' }]),
+      reporter,
+      isCancelled: () => false,
+      resolveToolCallArgs: identityArgs,
+      allowToolCalls: false,
+    });
+    assert.equal(stats.totalContentLength, 2);
+    assert.equal(stats.totalToolCalls, 0);
+    assert.deepEqual(events.map((e) => e.kind), ['text']);
+    assert.equal(events[0].value, 'hi');
+  });
+
+  test('strips tool-call-like JSON that arrives across multiple chunks', async () => {
+    const { reporter, events } = makeReporter();
+    const stats = await streamResponse({
+      chunks: iter([
+        { content: 'Optimized tool selectionCompacted conversation{"name":"read_file","arguments":{"filePath":"/path/to/file.txt","startLine":1' },
+        { content: ',"endLine":5}}' },
+      ]),
+      reporter,
+      isCancelled: () => false,
+      resolveToolCallArgs: identityArgs,
+      allowToolCalls: false,
+    });
+    assert.equal(stats.totalContentLength, events[0].value?.length ?? 0);
+    assert.equal(stats.totalToolCalls, 0);
+    assert.deepEqual(events.map((e) => e.kind), ['text']);
+    assert.equal(events[0].value, 'Optimized tool selectionCompacted conversation');
+  });
+
   test('stops early when isCancelled returns true', async () => {
     const { reporter, events } = makeReporter();
     let callCount = 0;

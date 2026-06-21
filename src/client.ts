@@ -11,6 +11,7 @@ import {
   ToolCallAccumulator,
   ToolCallDelta,
 } from './toolCallAccumulator';
+import { sanitizeContentForNoToolCalls } from './responseStreamer';
 
 /**
  * Trim trailing slashes and a trailing `/v1` (or `/openai/v1`) segment so the
@@ -233,6 +234,9 @@ export class GatewayClient {
     const timers = this.createStreamTimers(cancellationToken);
 
     try {
+      this.log(
+        `[debug] request model=${request.model} messages=${request.messages.length} tools=${Array.isArray(request.tools) ? request.tools.length : 0} toolChoice=${request.tool_choice ?? '<none>'}`
+      );
       const response = await fetch(url, {
         method: 'POST',
         headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
@@ -351,6 +355,7 @@ export class GatewayClient {
     if (!trimmed.startsWith(SSE_DATA_PREFIX)) { return null; }
 
     const data = trimmed.slice(SSE_DATA_PREFIX.length);
+    this.log(`[debug] raw=${data.length > 400 ? data.slice(0, 400) + '...' : data}`);
 
     let parsed: unknown;
     try {
@@ -362,6 +367,13 @@ export class GatewayClient {
     if (!parsed || typeof parsed !== 'object') { return null; }
 
     const obj = parsed as Record<string, unknown>;
+    const choiceCount = Array.isArray(obj.choices) ? obj.choices.length : 0;
+    const firstChoice = Array.isArray(obj.choices) ? obj.choices[0] : undefined;
+    const delta = firstChoice && typeof firstChoice === 'object' ? (firstChoice as Record<string, unknown>).delta : undefined;
+    const toolCallCount = delta && typeof delta === 'object' && Array.isArray((delta as Record<string, unknown>).tool_calls)
+      ? ((delta as Record<string, unknown>).tool_calls as unknown[]).length
+      : 0;
+    this.log(`[debug] parsed choices=${choiceCount} toolCalls=${toolCallCount}`);
 
     // Inline error payload: `{ "error": { "message": "..." } }`. Distinguished
     // from a normal chunk (which has `choices`).
@@ -448,8 +460,8 @@ export class GatewayClient {
     }
 
     return {
-      content: delta.content ?? '',
-      reasoningContent: delta.reasoning_content ?? '',
+      content: sanitizeContentForNoToolCalls(delta.content ?? ''),
+      reasoningContent: sanitizeContentForNoToolCalls(delta.reasoning_content ?? ''),
       finishedToolCalls,
     };
   }
@@ -473,8 +485,8 @@ export class GatewayClient {
     }
 
     return {
-      content: message.content ?? message.text ?? '',
-      reasoningContent: message.reasoning_content ?? '',
+      content: sanitizeContentForNoToolCalls(message.content ?? message.text ?? ''),
+      reasoningContent: sanitizeContentForNoToolCalls(message.reasoning_content ?? ''),
       finishedToolCalls,
     };
   }
