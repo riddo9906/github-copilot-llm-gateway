@@ -41,7 +41,8 @@
     "vllm",
     "Ollama",
     "llama.cpp",
-    "LocalAI"
+    "LocalAI",
+    "niblit"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -89,6 +90,11 @@
       {
         "command": "github.copilot.llm-gateway.showOutput",
         "title": "Show Output Log",
+        "category": "GitHub Copilot LLM Gateway"
+      },
+      {
+        "command": "github.copilot.llm-gateway.discoverNiblit",
+        "title": "Discover Local Niblit",
         "category": "GitHub Copilot LLM Gateway"
       }
     ],
@@ -174,6 +180,43 @@
           "additionalProperties": true,
           "description": "Extra parameters merged into the chat-completions request body (e.g. top_k, repetition_penalty, seed). Per-request modelOptions from the caller take precedence. Edit in settings.json for non-string values.",
           "order": 12
+        },
+        "github.copilot.llm-gateway.local.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable auto-discovery of local Niblit/llama-server inference. When enabled, the gateway probes http://127.0.0.1:8000 and http://127.0.0.1:8080 on startup and registers discovered models as a local provider.",
+          "order": 13
+        },
+        "github.copilot.llm-gateway.local.url": {
+          "type": "string",
+          "default": "http://127.0.0.1:8000/v1",
+          "description": "Niblit Cloud local OpenAI-compatible endpoint. Override if Niblit runs on a non-default port.",
+          "order": 14
+        },
+        "github.copilot.llm-gateway.local.timeout": {
+          "type": "number",
+          "default": 120000,
+          "description": "Request timeout for local inference in milliseconds.",
+          "order": 15
+        },
+        "github.copilot.llm-gateway.local.streaming": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable SSE streaming for local inference.",
+          "order": 16
+        },
+        "github.copilot.llm-gateway.local.autodiscover": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically probe Niblit Cloud and llama-server health endpoints on startup and every 30s.",
+          "order": 17
+        },
+        "github.copilot.llm-gateway.local.providerPriority": {
+          "type": "string",
+          "enum": ["auto", "cloud", "local", "hybrid"],
+          "default": "auto",
+          "description": "Provider selection policy: auto (prefer local when available), cloud (always use configured serverUrl), local (only Niblit), hybrid (round-robin).",
+          "order": 18
         }
       }
     }

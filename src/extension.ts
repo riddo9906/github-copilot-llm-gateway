@@ -6,6 +6,7 @@ import {
   extractHost,
   renderStatusBar,
 } from './statusBarController';
+import { NiblitLocalProvider } from './niblitLocalProvider';
 import { StatusSnapshot } from './statusSnapshot';
 import { renderStatusTooltipHtml } from './statusTooltip';
 
@@ -201,6 +202,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(disposable);
+
+  // Niblit Local Provider — auto-discovered local inference via llama-server
+  const niblitProvider = new NiblitLocalProvider(context);
+  const niblitDisposable = vscode.lm.registerLanguageModelChatProvider(
+    'niblit-local',
+    niblitProvider
+  );
+  context.subscriptions.push(niblitDisposable);
 
   // Status bar entry so users can see connection state at a glance and
   // quickly refresh the model list. Without this, failed model fetches were
@@ -414,6 +423,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(refreshCommand);
+
+  // "Discover Local Niblit" command — manually trigger Niblit auto-discovery
+  const discoverCommand = vscode.commands.registerCommand(
+    'github.copilot.llm-gateway.discoverNiblit',
+    async () => {
+      if (!niblitProvider) { return; }
+      await niblitProvider.runDiscovery();
+      const state = niblitProvider.getState();
+      if (state.available) {
+        vscode.window.showInformationMessage(
+          `Niblit Local: Discovered ${state.discovery.models.length} model(s) at ${state.discovery.endpointUrl}`
+        );
+      } else {
+        vscode.window.showWarningMessage(
+          'Niblit Local: Not found. Ensure Niblit Cloud is running (python main.py).'
+        );
+      }
+    }
+  );
+  context.subscriptions.push(discoverCommand);
 }
 
 /**
