@@ -112,9 +112,29 @@ interface ServerErrorPayload {
 
 export type GatewayLogger = (message: string) => void;
 
-const SSE_DATA_PREFIX = 'data: ';
+const SSE_DATA_PREFIX = 'data:';
 const SSE_DONE_LINE = 'data: [DONE]';
 const ERROR_PREFIX = 'Inference server reported an error mid-stream: ';
+const TRACE_SENSITIVE_HEADERS = /authorization|api[-_]key|token|secret|cookie/i;
+
+function elapsedMs(start: number): string {
+  return Math.round(performance.now() - start).toString();
+}
+
+function elapsedSince(start: number, point: number | undefined): string {
+  return point === undefined ? '<none>' : Math.round(point - start).toString();
+}
+
+function formatTraceHeaders(headers: Record<string, string>): string {
+  return JSON.stringify(
+    Object.fromEntries(
+      Object.entries(headers).map(([name, value]) => [
+        name,
+        TRACE_SENSITIVE_HEADERS.test(name) ? '<redacted>' : value,
+      ])
+    )
+  );
+}
 
 /**
  * Lifecycle handles for the AbortController + the two timers used by a
@@ -126,6 +146,8 @@ interface StreamTimers {
   readonly resetInactivity: () => void;
   /** Called once response headers arrive — switches to the inactivity timer. */
   readonly onHeadersReceived: () => void;
+  /** Explains whether the controller was aborted by VS Code or a timer. */
+  readonly abortReason: () => string | undefined;
   /** Clears every outstanding timer + cancellation subscription. */
   readonly dispose: () => void;
 }
@@ -232,14 +254,23 @@ export class GatewayClient {
     const url = `${normalizeBaseUrl(this.config.serverUrl)}/v1/chat/completions`;
     const accumulator = new ToolCallAccumulator();
     const timers = this.createStreamTimers(cancellationToken);
+    const requestStartedAt = performance.now();
+    let firstByteAt: number | undefined;
+    let firstDeltaAt: number | undefined;
+    let doneAt: number | undefined;
+    let rawFrameCount = 0;
 
     try {
+      const headers = { ...this.getHeaders(), 'Content-Type': 'application/json' };
+      this.log(
+        `[trace] request method=POST url=${url} model=${request.model} stream=true max_tokens=${request.max_tokens} timeout_ms=${this.config.requestTimeout} cancellation_requested=${cancellationToken.isCancellationRequested} headers=${formatTraceHeaders(headers)}`
+      );
       this.log(
         `[debug] request model=${request.model} messages=${request.messages.length} tools=${Array.isArray(request.tools) ? request.tools.length : 0} toolChoice=${request.tool_choice ?? '<none>'}`
       );
       const response = await fetch(url, {
         method: 'POST',
-        headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
+        headers,
         // `stream_options.include_usage` tells OpenAI-compatible servers to
         // emit a final SSE chunk containing `usage` totals once the model
         // finishes. We forward that to VS Code's chat context-window widget
@@ -253,21 +284,59 @@ export class GatewayClient {
         signal: timers.controller.signal,
       });
 
+      this.log(
+        `[trace] response_headers elapsed_ms=${elapsedMs(requestStartedAt)} status=${response.status} content_type=${response.headers.get('content-type') ?? '<missing>'}`
+      );
+
       // Headers received — switch from the request-deadline timer to the
       // per-chunk inactivity timer so long generations aren't aborted.
       timers.onHeadersReceived();
 
       await assertChatStreamResponseOk(response);
 
-      yield* this.readChatStreamChunks(response.body!, accumulator, cancellationToken, timers.resetInactivity);
+      yield* this.readChatStreamChunks(
+        response.body!,
+        accumulator,
+        cancellationToken,
+        timers.resetInactivity,
+        (kind, detail) => {
+          if (kind === 'byte' && firstByteAt === undefined) {
+            firstByteAt = performance.now();
+            this.log(`[trace] first_response_byte elapsed_ms=${elapsedMs(requestStartedAt)}`);
+          }
+          if (kind === 'frame' && rawFrameCount < 3) {
+            rawFrameCount++;
+            if (this.config.verboseLogging) { this.log(`[trace] sse_frame_${rawFrameCount}=${detail}`); }
+          }
+          if (kind === 'delta' && firstDeltaAt === undefined) {
+            firstDeltaAt = performance.now();
+            this.log(`[trace] first_sse_delta elapsed_ms=${elapsedMs(requestStartedAt)}`);
+          }
+          if (kind === 'done' && doneAt === undefined) {
+            doneAt = performance.now();
+            this.log(`[trace] sse_done elapsed_ms=${elapsedMs(requestStartedAt)}`);
+          }
+        }
+      );
+
+      this.log(
+        `[trace] request_complete elapsed_ms=${elapsedMs(requestStartedAt)} first_byte_ms=${elapsedSince(requestStartedAt, firstByteAt)} first_delta_ms=${elapsedSince(requestStartedAt, firstDeltaAt)} done_ms=${elapsedSince(requestStartedAt, doneAt)} done=${doneAt !== undefined} cancellation_requested=${cancellationToken.isCancellationRequested}`
+      );
 
       const remaining = accumulator.drain(true);
       if (remaining.length > 0) {
         yield { content: '', reasoning_content: '', tool_calls: [], finished_tool_calls: remaining };
       }
     } catch (error) {
+      this.log(
+        `[trace] request_error elapsed_ms=${elapsedMs(requestStartedAt)} abort_reason=${timers.abortReason() ?? '<none>'} first_byte_ms=${elapsedSince(requestStartedAt, firstByteAt)} first_delta_ms=${elapsedSince(requestStartedAt, firstDeltaAt)} done_ms=${elapsedSince(requestStartedAt, doneAt)}`
+      );
       if (error instanceof Error) {
-        throw new Error(`Chat completion request failed: ${error.message}`);
+        if (cancellationToken.isCancellationRequested) { return; }
+        const reason = timers.abortReason();
+        throw new Error(reason
+          ? `Chat completion ${reason} after ${this.config.requestTimeout}ms at ${url}`
+          : `Chat completion request failed: ${error.message}`);
       }
       throw error;
     } finally {
@@ -285,31 +354,50 @@ export class GatewayClient {
     body: ReadableStream<Uint8Array>,
     accumulator: ToolCallAccumulator,
     cancellationToken: vscode.CancellationToken,
-    resetInactivity: () => void
+    resetInactivity: () => void,
+    trace: (kind: 'byte' | 'frame' | 'delta' | 'done', detail?: string) => void
   ): AsyncGenerator<GatewayStreamChunk, void, unknown> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
 
+    try {
     while (true) {
       if (cancellationToken.isCancellationRequested) {
-        reader.cancel();
         return;
       }
 
       const { done, value } = await reader.read();
-      if (done) { return; }
+      if (!done) {
+        resetInactivity();
+        trace('byte');
+      }
 
-      resetInactivity();
-
-      buffer += decoder.decode(value, { stream: true });
+      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop() ?? '';
+      if (done && buffer) { lines.push(buffer); buffer = ''; }
 
       for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith(SSE_DATA_PREFIX)) {
+          trace('frame', trimmed.slice(SSE_DATA_PREFIX.length));
+          if (trimmed.slice(SSE_DATA_PREFIX.length).trim() === '[DONE]') {
+            trace('done');
+            return;
+          }
+        }
         const result = this.processSSELine(line, accumulator);
-        if (result) { yield result; }
+        if (result) {
+          if (result.content || result.reasoning_content) { trace('delta'); }
+          yield result;
+        }
       }
+      if (done) { return; }
+    }
+    } finally {
+      await reader.cancel().catch(() => { /* stream may already be aborted */ });
+      reader.releaseLock();
     }
   }
 
@@ -321,12 +409,26 @@ export class GatewayClient {
    */
   private createStreamTimers(cancellationToken: vscode.CancellationToken): StreamTimers {
     const controller = new AbortController();
-    const cancelSub = cancellationToken.onCancellationRequested(() => controller.abort());
-    const headerTimeoutId = setTimeout(() => controller.abort(), this.config.requestTimeout);
+    let abortReason: string | undefined;
+    const cancelSub = cancellationToken.onCancellationRequested(() => {
+      abortReason = 'vscode_cancellation';
+      controller.abort();
+    });
+    if (cancellationToken.isCancellationRequested) {
+      abortReason = 'vscode_cancellation';
+      controller.abort();
+    }
+    const headerTimeoutId = setTimeout(() => {
+      abortReason = 'header_timeout';
+      controller.abort();
+    }, this.config.requestTimeout);
     let inactivityTimeoutId: ReturnType<typeof setTimeout> | undefined;
     const resetInactivity = (): void => {
       if (inactivityTimeoutId) { clearTimeout(inactivityTimeoutId); }
-      inactivityTimeoutId = setTimeout(() => controller.abort(), this.config.requestTimeout);
+      inactivityTimeoutId = setTimeout(() => {
+        abortReason = 'inactivity_timeout';
+        controller.abort();
+      }, this.config.requestTimeout);
     };
     return {
       controller,
@@ -335,6 +437,7 @@ export class GatewayClient {
         clearTimeout(headerTimeoutId);
         resetInactivity();
       },
+      abortReason: () => abortReason,
       dispose: () => {
         clearTimeout(headerTimeoutId);
         if (inactivityTimeoutId) { clearTimeout(inactivityTimeoutId); }
@@ -355,7 +458,7 @@ export class GatewayClient {
     if (!trimmed.startsWith(SSE_DATA_PREFIX)) { return null; }
 
     const data = trimmed.slice(SSE_DATA_PREFIX.length);
-    this.log(`[debug] raw=${data.length > 400 ? data.slice(0, 400) + '...' : data}`);
+    if (this.config.verboseLogging) { this.log(`[debug] raw=${data.length > 400 ? data.slice(0, 400) + '...' : data}`); }
 
     let parsed: unknown;
     try {

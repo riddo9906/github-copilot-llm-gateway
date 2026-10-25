@@ -27,10 +27,8 @@ GitHub Copilot LLM Gateway
 
 ## Auto-Discovery
 
-On extension activation, the gateway probes:
+On extension activation, the local provider queries the configured OpenAI model endpoint:
 
-- `http://127.0.0.1:8000/healthz` — Niblit Cloud health
-- `http://127.0.0.1:8080/health` — llama-server health
 - `http://127.0.0.1:8000/v1/models` — OpenAI-compatible model list
 
 If found, models are registered under the `niblit-local` provider. Discovery repeats every 30 seconds.
@@ -44,16 +42,22 @@ If Niblit is not running, the gateway continues normally — no startup failure.
 | `github.copilot.llm-gateway.local.enabled` | `true` | Enable auto-discovery |
 | `github.copilot.llm-gateway.local.url` | `http://127.0.0.1:8000/v1` | Niblit Cloud endpoint |
 | `github.copilot.llm-gateway.local.timeout` | `120000` | Request timeout (ms) |
-| `github.copilot.llm-gateway.local.streaming` | `true` | Enable SSE streaming |
+| `github.copilot.llm-gateway.local.streaming` | `true` | Report SSE parts immediately; false buffers them until completion |
 | `github.copilot.llm-gateway.local.autodiscover` | `true` | Periodic health probes |
 | `github.copilot.llm-gateway.local.providerPriority` | `auto` | `auto`, `cloud`, `local`, `hybrid` |
 
-## Provider Priority
+## Provider Selection
 
-- **auto** (default): Prefer local Niblit when available, fall back to configured serverUrl
-- **cloud**: Always use the configured `serverUrl` (ignores local)
-- **local**: Only use Niblit Local (no cloud fallback)
-- **hybrid**: Round-robin between local and cloud
+Choose **LLM Gateway** or **Niblit Local** explicitly in VS Code's chat model picker.
+The registered vendor IDs are `copilot-llm-gateway` and `niblit-local`; both are declared in the extension manifest.
+`local.providerPriority` is a legacy setting and does not route requests between these vendors.
+
+For Niblit Cloud, set both server URLs to `http://127.0.0.1:8000/v1`.
+The gateway normalizes `/v1` before appending API paths. This URL is an inference endpoint and must not be used as an HTTP proxy.
+
+Use `defaultMaxTokens: 16384` and `defaultMaxOutputTokens: 1024` when the server omits context metadata.
+Set `modelOutputTokenLimits: { "qwen2.5-0.5b": 256 }` for the utility model.
+Caller output options can reduce these ceilings but cannot raise them. Cloud governance remains authoritative.
 
 ## Supported Endpoints
 
@@ -70,7 +74,6 @@ VS Code AI features that work through the local provider:
 
 - Copilot Chat
 - Agent Mode
-- Inline completion
 - Edit suggestions
 - Code explanation
 - Workspace reasoning

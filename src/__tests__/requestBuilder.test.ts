@@ -3,6 +3,18 @@ import assert from 'node:assert/strict';
 import { buildChatRequest } from '../requestBuilder';
 
 describe('buildChatRequest', () => {
+  test('caller aliases lower but cannot raise the computed output ceiling', () => {
+    for (const key of ['max_tokens', 'maxTokens', 'max_completion_tokens', 'maxOutputTokens', 'max_output_tokens']) {
+      const options = { model: 'qwen2.5-coder-3b', messages: [], maxTokens: 256, temperature: 0 };
+      assert.equal(buildChatRequest({ ...options, extraOptions: { [key]: 15752 } }).max_tokens, 256);
+      const extras = { [key]: 32, top_p: 0.9 };
+      const result = buildChatRequest({ ...options, extraOptions: extras });
+      assert.equal(result.max_tokens, 32);
+      assert.equal(result.top_p, 0.9);
+      if (key !== 'max_tokens') { assert.equal(result[key], undefined); }
+      assert.deepEqual(extras, { [key]: 32, top_p: 0.9 });
+    }
+  });
   test('builds a minimal request without tools', () => {
     const req = buildChatRequest({
       model: 'my-model',

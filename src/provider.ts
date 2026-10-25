@@ -58,7 +58,7 @@ import {
   parseCustomHeadersJson,
 } from './secretMigration';
 
-const DEFAULT_REQUEST_TIMEOUT_MS = 60000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 120000;
 const DEFAULT_TEMPERATURE = 0.7;
 const DEBUG_REQUEST_MAX_LOG_LENGTH = 2000;
 const MAX_TOOL_ARGS_LOG_LENGTH = 1000;
@@ -132,6 +132,8 @@ const MODEL_AFFECTING_KEYS: readonly string[] = [
   'github.copilot.llm-gateway.requestTimeout',
   'github.copilot.llm-gateway.defaultMaxTokens',
   'github.copilot.llm-gateway.defaultMaxOutputTokens',
+  'github.copilot.llm-gateway.modelOutputTokenLimits',
+  'github.copilot.llm-gateway.local',
   'github.copilot.llm-gateway.enableImageInput',
   'github.copilot.llm-gateway.enableToolCalling',
   'github.copilot.llm-gateway.customHeaders',
@@ -229,8 +231,12 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   private lastSuccessfulFetchAt?: number;
   private lastConnectionError?: string;
 
-  constructor(context: vscode.ExtensionContext) {
-    this.outputChannel = vscode.window.createOutputChannel('GitHub Copilot LLM Gateway');
+  constructor(
+    context: vscode.ExtensionContext,
+    private readonly configTransform: (config: GatewayConfig) => GatewayConfig = (config) => config,
+    outputName = 'GitHub Copilot LLM Gateway'
+  ) {
+    this.outputChannel = vscode.window.createOutputChannel(outputName);
     this.secrets = context.secrets;
     this.config = this.loadConfig();
     this.client = new GatewayClient(this.config, (msg) => this.outputChannel.appendLine(msg));
@@ -541,7 +547,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       const { info, totalContext, hasServerReportedContext } = buildModelInfo({
         model,
         defaultMaxTokens: this.config.defaultMaxTokens,
-        defaultMaxOutputTokens: this.config.defaultMaxOutputTokens,
+        defaultMaxOutputTokens: Math.min(this.config.defaultMaxOutputTokens,
+          this.config.modelOutputTokenLimits?.[model.id] ?? this.config.defaultMaxOutputTokens),
         capabilities: {
           imageInput: this.config.enableImageInput,
           toolCalling: this.config.enableToolCalling,
@@ -587,13 +594,16 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
      this.outputChannel.appendLine(`Converted to ${openAIMessages.length} OpenAI messages`);
      this.logMessageStructure(openAIMessages);
      const systemPreview = openAIMessages.find((msg) => msg.role === 'system');
-     this.outputChannel.appendLine(
+     if (this.config.verboseLogging) { this.outputChannel.appendLine(
        `[debug] system=${typeof systemPreview?.content === 'string' ? systemPreview.content.slice(0, 120) : '<none>'} roles=${openAIMessages.map((msg) => msg.role).join(',')}`
-     );
+     ); }
 
    const modelMaxContext = this.resolveModelMaxContext(model);
-   const configuredMaxOutput =
-    model.maxOutputTokens || TOKEN_CONSTANTS.DEFAULT_OUTPUT_TOKENS;
+   const configuredMaxOutput = Math.min(
+    model.maxOutputTokens || TOKEN_CONSTANTS.DEFAULT_OUTPUT_TOKENS,
+    this.config.defaultMaxOutputTokens,
+    this.config.modelOutputTokenLimits?.[model.id] ?? this.config.defaultMaxOutputTokens
+   );
   const toolsSerializedLength = options.tools ? JSON.stringify(options.tools).length : 0;
 
   const maxInputTokens = calculateMaxInputTokens({
@@ -699,6 +709,11 @@ this.outputChannel.appendLine(
         this.resolveToolCallArgs(toolCall, toolSchemas),
       allowToolCalls: hasTools,
     });
+
+    if (token.isCancellationRequested) {
+      this._onDidChangeRequestState.fire({ kind: 'complete', modelId: model.id, modelName });
+      return;
+    }
 
     this.outputChannel.appendLine(
       `Completed chat request, received ${stats.totalContentLength} chars, ${stats.totalTextParts} text parts, ${stats.totalToolCalls} tool calls`
@@ -1266,6 +1281,7 @@ this.outputChannel.appendLine(
       verboseLogging: config.get<boolean>('verboseLogging', false),
       customHeaders: { ...this.secretCache.customHeaders },
       extraModelOptions: config.get<Record<string, unknown>>('extraModelOptions', {}) ?? {},
+      modelOutputTokenLimits: config.get<Record<string, number>>('modelOutputTokenLimits', {}),
     };
 
     const MAX_INT32 = 2147483647; // Maximum value for setTimeout (signed 32-bit integer)
@@ -1331,7 +1347,7 @@ this.outputChannel.appendLine(
       this.lastOutputTokenAdjustmentNotified = undefined;
     }
 
-    return cfg;
+    return this.configTransform(cfg);
   }
 
   private reloadConfig(): void {

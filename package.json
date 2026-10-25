@@ -51,6 +51,11 @@
   "contributes": {
     "languageModelChatProviders": [
       {
+        "vendor": "niblit-local",
+        "displayName": "Niblit Local",
+        "managementCommand": "github.copilot.llm-gateway.discoverNiblit"
+      },
+      {
         "vendor": "copilot-llm-gateway",
         "displayName": "LLM Gateway",
         "managementCommand": "github.copilot.llm-gateway.manage",
@@ -116,7 +121,7 @@
         },
         "github.copilot.llm-gateway.requestTimeout": {
           "type": "number",
-          "default": 60000,
+          "default": 120000,
           "description": "Request timeout in milliseconds",
           "order": 3
         },
@@ -131,6 +136,12 @@
           "default": 4096,
           "description": "Fallback maximum output tokens when the server does not report context size",
           "order": 5
+        },
+        "github.copilot.llm-gateway.modelOutputTokenLimits": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": { "type": "integer", "minimum": 1 },
+          "description": "Per-model output token ceilings, also applied to caller modelOptions. Use a small ceiling for utility models."
         },
         "github.copilot.llm-gateway.enableImageInput": {
           "type": "boolean",
@@ -202,7 +213,7 @@
         "github.copilot.llm-gateway.local.streaming": {
           "type": "boolean",
           "default": true,
-          "description": "Enable SSE streaming for local inference.",
+          "description": "Report local SSE response parts immediately. When disabled, buffer parts until generation completes.",
           "order": 16
         },
         "github.copilot.llm-gateway.local.autodiscover": {

@@ -73,10 +73,6 @@ export function buildChatRequest(
       `[ToolPipeline] input=${inputTools.length} routed=${routedTools.length}`
     );
 
-    if (routedTools.length === 0) {
-      return request;
-    }
-
     const compactTools = ToolSchemaBuilder.build(routedTools, {
       maxTools: getMaxToolsForModel(options.model),
       maxDescriptionLength: 120
@@ -105,17 +101,20 @@ export function buildChatRequest(
   if (options.extraOptions) {
 
     // Prevent downstream code from re-enabling tools
-    delete (options.extraOptions as any).tools;
-    delete (options.extraOptions as any).tool_choice;
-    delete (options.extraOptions as any).parallel_tool_calls;
-
-    Object.assign(request, options.extraOptions);
+    const extras = { ...options.extraOptions };
+    for (const key of ['tools', 'tool_choice', 'parallel_tool_calls', 'maxTokens', 'max_tokens', 'max_completion_tokens', 'maxOutputTokens', 'max_output_tokens']) {
+      delete extras[key];
+    }
+    Object.assign(request, extras);
   }
 
-  console.log(
-    "[OpenAI Request]",
-    JSON.stringify(request, null, 2)
-  );
+  // Caller budgets may lower the computed ceiling, but never raise it.
+  const requested = options.extraOptions ?? {};
+  request.max_tokens = Math.min(options.maxTokens, ...[
+    requested.max_tokens, requested.maxTokens, requested.max_completion_tokens,
+    requested.maxOutputTokens, requested.max_output_tokens,
+  ].filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 1)
+    .map((value) => Math.floor(value)));
 
   return request;
 }

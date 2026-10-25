@@ -119,6 +119,7 @@ export interface GatewayConfig {
   requestTimeout: number;
   defaultMaxTokens: number;
   defaultMaxOutputTokens: number;
+  modelOutputTokenLimits?: Record<string, number>;
   enableImageInput: boolean;
   enableToolCalling: boolean;
   parallelToolCalling: boolean;

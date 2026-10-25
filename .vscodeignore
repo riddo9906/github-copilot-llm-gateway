@@ -1,5 +1,9 @@
 .vscode/**
 .vscode-test/**
+.vscode-smoke-profile/**
+.vscode-smoke-report.json
+.gateway-*.log
+scripts/**
 src/**
 .gitignore
 .eslintrc.json
