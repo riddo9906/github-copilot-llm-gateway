@@ -84,7 +84,25 @@ describe('stream lifecycle', () => {
     assert.equal(cancel.listeners.size, 0);
   });
 
-  test('distinguishes body inactivity from user cancellation', async (t) => {
+  test('allows buffered generation beyond the stream inactivity deadline', async (t) => {
+    t.mock.method(globalThis, 'fetch', async (_url: string, init: RequestInit) => new Response(new ReadableStream({
+      start(controller) {
+        const timer = setTimeout(() => {
+          controller.enqueue(new TextEncoder().encode(delta + 'data: [DONE]\n\n'));
+        }, 60);
+        init.signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          controller.error(new DOMException('aborted', 'AbortError'));
+        }, { once: true });
+      },
+    })));
+    const chunks = [];
+    for await (const chunk of new GatewayClient({ ...config, requestTimeout: 20, firstResponseTimeout: 1000 })
+      .streamChatCompletion(request, cancellation().token)) { chunks.push(chunk.content); }
+    assert.equal(chunks.join(''), 'hello');
+  });
+
+  test('bounds first-byte waiting and preserves cancellation during generation', async (t) => {
     t.mock.method(globalThis, 'fetch', async (_url: string, init: RequestInit) => new Response(new ReadableStream({
       start(controller) {
         init.signal?.addEventListener('abort', () => controller.error(new DOMException('aborted', 'AbortError')), { once: true });
@@ -92,12 +110,27 @@ describe('stream lifecycle', () => {
     })));
     await assert.rejects(async () => {
       for await (const _chunk of new GatewayClient({ ...config, requestTimeout: 20 }).streamChatCompletion(request, cancellation().token)) { /* consume */ }
-    }, /inactivity_timeout/);
+    }, /first_response_timeout after 20ms/);
     const cancel = cancellation();
     const stream = new GatewayClient(config).streamChatCompletion(request, cancel.token);
     const pending = stream.next();
     cancel.cancel();
     assert.equal((await pending).done, true);
+    assert.equal(cancel.listeners.size, 0);
+  });
+
+  test('switches to the shorter inactivity deadline after the first byte', async (t) => {
+    t.mock.method(globalThis, 'fetch', async (_url: string, init: RequestInit) => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(delta));
+        init.signal?.addEventListener('abort', () => controller.error(new DOMException('aborted', 'AbortError')), { once: true });
+      },
+    })));
+    const cancel = cancellation();
+    await assert.rejects(async () => {
+      for await (const _chunk of new GatewayClient({ ...config, requestTimeout: 20, firstResponseTimeout: 1000 })
+        .streamChatCompletion(request, cancel.token)) { /* consume */ }
+    }, /inactivity_timeout after 20ms/);
     assert.equal(cancel.listeners.size, 0);
   });
 

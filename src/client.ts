@@ -242,10 +242,8 @@ export class GatewayClient {
   /**
    * Stream chat completions from `/v1/chat/completions`. Tool calls are
    * accumulated by index across chunks (their `id` may arrive later than
-   * their name/arguments). Manages two timers explicitly:
-   *   - the configured `requestTimeout` applies until headers arrive,
-   *   - then a per-read inactivity timer of the same duration is reset on
-   *     each chunk so long generations aren't aborted mid-stream.
+   * their name/arguments). requestTimeout bounds headers and stream stalls;
+   * firstResponseTimeout allows buffered inference to produce its first byte.
    */
   public async *streamChatCompletion(
     request: OpenAIChatCompletionRequest,
@@ -263,7 +261,7 @@ export class GatewayClient {
     try {
       const headers = { ...this.getHeaders(), 'Content-Type': 'application/json' };
       this.log(
-        `[trace] request method=POST url=${url} model=${request.model} stream=true max_tokens=${request.max_tokens} timeout_ms=${this.config.requestTimeout} cancellation_requested=${cancellationToken.isCancellationRequested} headers=${formatTraceHeaders(headers)}`
+        `[trace] request method=POST url=${url} model=${request.model} stream=true max_tokens=${request.max_tokens} timeout_ms=${this.config.requestTimeout} first_response_timeout_ms=${this.config.firstResponseTimeout ?? this.config.requestTimeout} cancellation_requested=${cancellationToken.isCancellationRequested} headers=${formatTraceHeaders(headers)}`
       );
       this.log(
         `[debug] request model=${request.model} messages=${request.messages.length} tools=${Array.isArray(request.tools) ? request.tools.length : 0} toolChoice=${request.tool_choice ?? '<none>'}`
@@ -288,8 +286,7 @@ export class GatewayClient {
         `[trace] response_headers elapsed_ms=${elapsedMs(requestStartedAt)} status=${response.status} content_type=${response.headers.get('content-type') ?? '<missing>'}`
       );
 
-      // Headers received — switch from the request-deadline timer to the
-      // per-chunk inactivity timer so long generations aren't aborted.
+      // Headers do not imply generation has finished on buffered backends.
       timers.onHeadersReceived();
 
       await assertChatStreamResponseOk(response);
@@ -334,8 +331,11 @@ export class GatewayClient {
       if (error instanceof Error) {
         if (cancellationToken.isCancellationRequested) { return; }
         const reason = timers.abortReason();
+        const timeout = reason === 'first_response_timeout'
+          ? this.config.firstResponseTimeout ?? this.config.requestTimeout
+          : this.config.requestTimeout;
         throw new Error(reason
-          ? `Chat completion ${reason} after ${this.config.requestTimeout}ms at ${url}`
+          ? `Chat completion ${reason} after ${timeout}ms at ${url}`
           : `Chat completion request failed: ${error.message}`);
       }
       throw error;
@@ -402,10 +402,8 @@ export class GatewayClient {
   }
 
   /**
-   * Wire up the AbortController, request-deadline timer, and per-chunk
-   * inactivity timer used by the streaming request. The two timers run
-   * sequentially: the request timer fires until headers arrive, then the
-   * inactivity timer takes over and is reset on each chunk.
+   * Header deadline, buffered first-byte deadline, and then per-byte inactivity.
+   * All phases share explicit VS Code cancellation and request-scoped cleanup.
    */
   private createStreamTimers(cancellationToken: vscode.CancellationToken): StreamTimers {
     const controller = new AbortController();
@@ -423,6 +421,7 @@ export class GatewayClient {
       controller.abort();
     }, this.config.requestTimeout);
     let inactivityTimeoutId: ReturnType<typeof setTimeout> | undefined;
+    const firstResponseTimeout = this.config.firstResponseTimeout ?? this.config.requestTimeout;
     const resetInactivity = (): void => {
       if (inactivityTimeoutId) { clearTimeout(inactivityTimeoutId); }
       inactivityTimeoutId = setTimeout(() => {
@@ -435,7 +434,10 @@ export class GatewayClient {
       resetInactivity,
       onHeadersReceived: () => {
         clearTimeout(headerTimeoutId);
-        resetInactivity();
+        inactivityTimeoutId = setTimeout(() => {
+          abortReason = 'first_response_timeout';
+          controller.abort();
+        }, firstResponseTimeout);
       },
       abortReason: () => abortReason,
       dispose: () => {

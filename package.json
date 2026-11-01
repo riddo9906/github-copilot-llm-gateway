@@ -122,8 +122,15 @@
         "github.copilot.llm-gateway.requestTimeout": {
           "type": "number",
           "default": 120000,
-          "description": "Request timeout in milliseconds",
+          "description": "Timeout for response headers and for inactivity after the first response body byte, in milliseconds. Use firstResponseTimeout for buffered generation before the first byte.",
           "order": 3
+        },
+        "github.copilot.llm-gateway.firstResponseTimeout": {
+          "type": "integer",
+          "default": 600000,
+          "minimum": 1,
+          "maximum": 2147483647,
+          "description": "Time allowed after response headers until the first body byte. Buffered local inference can finish generation before sending SSE data. After the first byte, requestTimeout controls stream inactivity."
         },
         "github.copilot.llm-gateway.defaultMaxTokens": {
           "type": "number",

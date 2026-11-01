@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { GatewayClient } from './client';
 import { GatewayConfig, OpenAIChatCompletionRequest, OpenAIMessage } from './types';
-import { ToolRouter } from './toolRouter';
+import { budgetChatRequest } from './requestBudget';
 import {
   convertMessage,
   flattenToolResultContent,
@@ -11,11 +11,7 @@ import {
 } from './messageConverter';
 import {
   TOKEN_CONSTANTS,
-  buildInputText,
-  calculateMaxInputTokens,
-  calculateSafeMaxOutputTokens,
   estimateTextTokens,
-  truncateMessagesToFit,
 } from './tokenBudget';
 import { tryRepairJson } from './jsonRepair';
 import { fillMissingRequiredProperties } from './toolSchema';
@@ -130,6 +126,7 @@ const MODEL_AFFECTING_KEYS: readonly string[] = [
   'github.copilot.llm-gateway.serverUrl',
   'github.copilot.llm-gateway.apiKey',
   'github.copilot.llm-gateway.requestTimeout',
+  'github.copilot.llm-gateway.firstResponseTimeout',
   'github.copilot.llm-gateway.defaultMaxTokens',
   'github.copilot.llm-gateway.defaultMaxOutputTokens',
   'github.copilot.llm-gateway.modelOutputTokenLimits',
@@ -588,7 +585,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
      this.outputChannel.appendLine(`Message count: ${messages.length}`);
 
    const modelName = friendlyModelName(model.id);
-     this._onDidChangeRequestState.fire({ kind: 'start', modelId: model.id, modelName });
 
    const openAIMessages = this.convertAllMessages(messages);
      this.outputChannel.appendLine(`Converted to ${openAIMessages.length} OpenAI messages`);
@@ -604,38 +600,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     this.config.defaultMaxOutputTokens,
     this.config.modelOutputTokenLimits?.[model.id] ?? this.config.defaultMaxOutputTokens
    );
-  const toolsSerializedLength = options.tools ? JSON.stringify(options.tools).length : 0;
-
-  const maxInputTokens = calculateMaxInputTokens({
-    modelMaxContext,
-    configuredMaxOutput,
-    toolsSerializedLength,
-  });
-
-  const truncatedMessages = truncateMessagesToFit(openAIMessages, maxInputTokens, (msg) =>
-    this.outputChannel.appendLine(msg)
-   );
-
-  if (truncatedMessages.length < openAIMessages.length) {
-    this.outputChannel.appendLine(
-      `WARNING: Truncated conversation from ${openAIMessages.length} to ${truncatedMessages.length} messages to fit context limit`
-    );
-  }
-
-  const inputText = buildInputText(truncatedMessages);
-  const toolsOverhead = Math.ceil(toolsSerializedLength / TOKEN_CONSTANTS.CHARS_PER_TOKEN);
-  const estimatedInputTokens = await this.provideTokenCount(model, inputText, token);
-
-  const safeMaxOutputTokens = calculateSafeMaxOutputTokens({
-    estimatedInputTokens,
-    toolsOverhead,
-    modelMaxContext,
-    configuredMaxOutput,
-  });
-
-  this.outputChannel.appendLine(
-    `Token estimate: input=${estimatedInputTokens}, tools=${toolsOverhead}, model_context=${modelMaxContext}, chosen_max_tokens=${safeMaxOutputTokens}`
-   );
 
   // -----------------------------
 // TOOL ROUTING PIPELINE
@@ -646,37 +610,31 @@ const {
   schemas: toolSchemas,
 } = this.buildToolsConfig(options);
 
-const tools = allTools
-  ? ToolRouter.select(allTools, {
-      model: model.id,
-      messages: truncatedMessages,
-    })
-  : undefined;
-
-this.outputChannel.appendLine(
-  `[ToolPipeline] input=${allTools?.length ?? 0} routed=${tools?.length ?? 0}`
-);
-  this.outputChannel.appendLine(
-    `[debug] tools=${tools?.map((tool) => tool.function?.name ?? '?').join(',') ?? '<none>'}`
-  );
-  const hasTools = Array.isArray(tools) && tools.length > 0;
-  const temperature = hasTools
+  const temperature = allTools?.length
     ? this.config.agentTemperature
     : DEFAULT_TEMPERATURE;
 
-  const requestOptions = buildChatRequest({
+  const preparedRequest = buildChatRequest({
     model: model.id,
-    messages: truncatedMessages,
-    maxTokens: safeMaxOutputTokens,
+    messages: openAIMessages,
+    maxTokens: configuredMaxOutput,
     temperature,
-    tools,
-    toolChoice: hasTools ? this.mapToolChoice(options.toolMode) : undefined,
-    parallelToolCalls: hasTools ? this.config.parallelToolCalling : undefined,
+    tools: allTools,
+    toolChoice: this.mapToolChoice(options.toolMode),
+    parallelToolCalls: this.config.parallelToolCalling,
     extraOptions: {
       ...this.config.extraModelOptions,
       ...options.modelOptions,
     },
   });
+
+  const { request: requestOptions, inputText } = budgetChatRequest(
+    preparedRequest, modelMaxContext, configuredMaxOutput,
+    (message) => this.outputChannel.appendLine(message)
+  );
+  const tools = requestOptions.tools ?? [];
+  const hasTools = tools.length > 0;
+  this.outputChannel.appendLine(`[ToolPipeline] input=${allTools?.length ?? 0} transmitted=${tools.length}`);
 
   if (hasTools) {
     this.outputChannel.appendLine(
@@ -692,6 +650,7 @@ this.outputChannel.appendLine(
   let capturedUsage: TokenUsage | undefined;
 
   try {
+    this._onDidChangeRequestState.fire({ kind: 'start', modelId: model.id, modelName });
     const reporter = this.createStreamReporter(
       progress,
       (usage) => {
@@ -1269,6 +1228,7 @@ this.outputChannel.appendLine(
       // framework UI.
       apiKey: resolveApiKey(this.frameworkOverride, this.secretCache.apiKey),
       requestTimeout: config.get<number>('requestTimeout', DEFAULT_REQUEST_TIMEOUT_MS),
+      firstResponseTimeout: config.get<number>('firstResponseTimeout', 600000),
       defaultMaxTokens: config.get<number>('defaultMaxTokens', TOKEN_CONSTANTS.DEFAULT_CONTEXT_TOKENS),
       defaultMaxOutputTokens: config.get<number>(
         'defaultMaxOutputTokens',
@@ -1285,6 +1245,10 @@ this.outputChannel.appendLine(
     };
 
     const MAX_INT32 = 2147483647; // Maximum value for setTimeout (signed 32-bit integer)
+    if (typeof cfg.firstResponseTimeout !== 'number' || !Number.isFinite(cfg.firstResponseTimeout) || cfg.firstResponseTimeout <= 0) {
+      cfg.firstResponseTimeout = 600000;
+    }
+    cfg.firstResponseTimeout = Math.min(cfg.firstResponseTimeout, MAX_INT32);
     if (cfg.requestTimeout <= 0) {
       this.outputChannel.appendLine(
         `ERROR: requestTimeout must be > 0; using default ${DEFAULT_REQUEST_TIMEOUT_MS}`

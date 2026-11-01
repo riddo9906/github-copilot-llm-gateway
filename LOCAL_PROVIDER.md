@@ -42,6 +42,7 @@ If Niblit is not running, the gateway continues normally — no startup failure.
 | `github.copilot.llm-gateway.local.enabled` | `true` | Enable auto-discovery |
 | `github.copilot.llm-gateway.local.url` | `http://127.0.0.1:8000/v1` | Niblit Cloud endpoint |
 | `github.copilot.llm-gateway.local.timeout` | `120000` | Request timeout (ms) |
+| `github.copilot.llm-gateway.firstResponseTimeout` | `600000` | Wait for first body byte after headers; allows buffered local generation |
 | `github.copilot.llm-gateway.local.streaming` | `true` | Report SSE parts immediately; false buffers them until completion |
 | `github.copilot.llm-gateway.local.autodiscover` | `true` | Periodic health probes |
 | `github.copilot.llm-gateway.local.providerPriority` | `auto` | `auto`, `cloud`, `local`, `hybrid` |
@@ -58,6 +59,15 @@ The gateway normalizes `/v1` before appending API paths. This URL is an inferenc
 Use `defaultMaxTokens: 16384` and `defaultMaxOutputTokens: 1024` when the server omits context metadata.
 Set `modelOutputTokenLimits: { "qwen2.5-0.5b": 256 }` for the utility model.
 Caller output options can reduce these ceilings but cannot raise them. Cloud governance remains authoritative.
+
+Cloud currently buffers generation before yielding its first SSE frame. A long CPU prompt can therefore
+produce HTTP 200 headers promptly but send no body bytes for several minutes. `firstResponseTimeout`
+allows up to ten minutes for that first byte; `requestTimeout` still bounds connection headers and
+subsequent stream inactivity to two minutes by default. Explicit VS Code cancellation applies in all phases.
+
+Token accounting uses the transmitted tool schemas after routing and compaction. The full offered tool
+catalog does not consume the request's context budget. Requests that cannot retain the latest message
+fail with a context error instead of silently sending only an earlier message.
 
 ## Supported Endpoints
 

@@ -117,6 +117,7 @@ export interface GatewayConfig {
   serverUrl: string;
   apiKey?: string;
   requestTimeout: number;
+  firstResponseTimeout?: number;
   defaultMaxTokens: number;
   defaultMaxOutputTokens: number;
   modelOutputTokenLimits?: Record<string, number>;
